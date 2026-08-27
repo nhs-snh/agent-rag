@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Model cache (本地下载的模型文件很大，不要推到 GitHub)
+index_data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+*.key

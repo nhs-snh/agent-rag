@@ -1,0 +1,24 @@
+# FusionRAG - 智能客服 Agent 系统依赖
+# Python 3.11 / 3.12 推荐（3.13 部分库兼容性问题）
+
+# ===== 核心框架 =====
+langchain>=0.3.0
+langchain-openai>=0.2.0
+langchain-community>=0.3.0
+
+# ===== 向量检索 =====
+faiss-cpu>=1.7.4              # FAISS 向量索引（GPU 版用 faiss-gpu）
+sentence-transformers>=2.2.0  # 加载 bge 系列嵌入/重排模型
+
+# ===== 稀疏检索 =====
+rank-bm25>=0.2.2              # BM25 算法实现
+jieba>=0.42.1                 # 中文分词
+
+# ===== 文档处理 =====
+langchain-text-splitters>=0.3.0
+
+# ===== 前端 =====
+streamlit>=1.30.0
+
+# ===== 工具类 =====
+pydantic>=2.0

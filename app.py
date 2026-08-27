@@ -1,0 +1,224 @@
+"""
+FusionRAG Streamlit 前端
+==========================
+Web 界面，支持：
+- 流式 Token 输出（逐字渲染 LLM 回复）
+- 检索上下文展示（展示 RAG 命中的参考文档）
+- 多轮对话记忆（上下文连贯）
+- 对话历史清空
+
+启动命令：
+    streamlit run app.py
+"""
+
+import streamlit as st
+from agent import FusionRAGAgent
+import os
+
+# ==================== 页面配置 ====================
+
+st.set_page_config(
+    page_title="FusionRAG · 智能客服 Agent",
+    page_icon="🤖",
+    layout="wide",
+)
+
+# ==================== 自定义样式 ====================
+
+st.markdown("""
+<style>
+    /* 主标题 */
+    .main-title {
+        font-size: 2rem;
+        font-weight: 700;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        margin-bottom: 0.5rem;
+    }
+    .sub-title {
+        color: #888;
+        font-size: 0.9rem;
+        margin-bottom: 1.5rem;
+    }
+    /* 参考文档卡片 */
+    .ref-card {
+        background: #f8f9fa;
+        border-left: 3px solid #667eea;
+        padding: 0.8rem 1rem;
+        margin: 0.5rem 0;
+        border-radius: 0 8px 8px 0;
+        font-size: 0.85rem;
+    }
+    .ref-score {
+        color: #667eea;
+        font-weight: 600;
+        font-size: 0.8rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ==================== Session State 初始化 ====================
+
+@st.cache_resource
+def init_agent():
+    """
+    初始化 Agent（全局单例）。
+    @st.cache_resource 确保只初始化一次，多用户共享模型实例。
+    """
+    agent = FusionRAGAgent()
+    return agent
+
+
+def init_session():
+    """初始化会话状态变量。"""
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    if "knowledge_loaded" not in st.session_state:
+        st.session_state.knowledge_loaded = False
+
+    if "ref_docs" not in st.session_state:
+        st.session_state.ref_docs = []
+
+
+# ==================== 侧边栏 ====================
+
+def render_sidebar(agent: FusionRAGAgent):
+    """渲染侧边栏：知识库加载、模型信息、对话管理。"""
+    with st.sidebar:
+        st.header("⚙️ 控制面板")
+
+        # 知识库文件路径
+        knowledge_file = st.text_input(
+            "知识库文件路径",
+            value="sample_knowledge.txt",
+            help="支持 .txt 格式的文本文件，UTF-8 编码"
+        )
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("📂 加载知识库", use_container_width=True):
+                if os.path.exists(knowledge_file):
+                    with st.spinner("构建索引中（首次约需2-5分钟）..."):
+                        agent.load_knowledge(knowledge_file)
+                        st.session_state.knowledge_loaded = True
+                    st.success(f"✅ 知识库加载成功")
+                else:
+                    st.error(f"文件不存在: {knowledge_file}")
+
+        with col2:
+            if st.button("🔄 强制重建", use_container_width=True):
+                if os.path.exists(knowledge_file):
+                    with st.spinner("重建索引中..."):
+                        agent.load_knowledge(knowledge_file, force_rebuild=True)
+                    st.success("✅ 索引已重建")
+
+        # 知识库状态
+        status = "✅ 已加载" if st.session_state.knowledge_loaded else "❌ 未加载"
+        st.metric("知识库状态", status)
+
+        st.divider()
+
+        # 模型信息
+        st.subheader("🧠 模型信息")
+        st.text(f"LLM: qwen-plus (DashScope)")
+        st.text(f"Embedding: bge-large-zh-v1.5")
+        st.text(f"Reranker: bge-reranker-large")
+        st.text(f"向量库: FAISS")
+        st.text(f"稀疏检索: BM25 + jieba")
+
+        st.divider()
+
+        # 对话管理
+        st.subheader("💬 对话管理")
+        if st.button("🗑️ 清空对话", use_container_width=True):
+            agent.clear_history()
+            st.session_state.messages = []
+            st.session_state.ref_docs = []
+            st.rerun()
+
+        # 当前对话轮数
+        msg_count = len(st.session_state.messages)
+        st.metric("对话轮数", f"{msg_count // 2} 轮")
+
+
+# ==================== 主界面 ====================
+
+def render_main(agent: FusionRAGAgent):
+    """渲染主界面：标题、对话消息、输入框。"""
+
+    # 标题
+    st.markdown('<div class="main-title">FusionRAG · 智能客服 Agent</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="sub-title">FAISS + BM25 混合检索 · CrossEncoder 精排 · Qwen · Tool Calling</div>',
+        unsafe_allow_html=True,
+    )
+
+    # 渲染历史消息
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # 用户输入框
+    if prompt := st.chat_input("输入你的问题..."):
+        # 显示用户消息
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        # Agent 流式回复
+        with st.chat_message("assistant"):
+            # 占位符，用于逐步更新内容
+            response_placeholder = st.empty()
+            ref_placeholder = st.empty()
+            full_response = ""
+
+            try:
+                for event_type, data in agent.ask_stream(prompt):
+
+                    if event_type == "context":
+                        # 展示检索到的参考文档
+                        st.session_state.ref_docs = data
+                        with ref_placeholder.container():
+                            st.markdown("**📚 检索参考：**")
+                            for i, doc in enumerate(data, 1):
+                                st.markdown(
+                                    f'<div class="ref-card">'
+                                    f'<span class="ref-score">参考{i} · 相关度 {doc.score:.4f}</span><br>'
+                                    f'{doc.text[:200]}{"..." if len(doc.text) > 200 else ""}'
+                                    f'</div>',
+                                    unsafe_allow_html=True,
+                                )
+
+                    elif event_type == "token":
+                        # 逐 Token 追加渲染
+                        full_response += data
+                        response_placeholder.markdown(full_response + "▌")
+
+                # 流式结束，移除光标
+                response_placeholder.markdown(full_response)
+
+            except Exception as e:
+                full_response = f"❌ 回答出错: {str(e)}"
+                response_placeholder.markdown(full_response)
+
+            # 记录助手回复
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": full_response,
+            })
+
+
+# ==================== 入口 ====================
+
+def main():
+    init_session()
+    agent = init_agent()
+    render_sidebar(agent)
+    render_main(agent)
+
+
+if __name__ == "__main__":
+    main()
