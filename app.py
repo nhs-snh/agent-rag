@@ -2,6 +2,7 @@
 FusionRAG Streamlit 前端
 ==========================
 Web 界面，支持：
+- ReAct 推理过程可视化（Thought → Action → Observation 可视化）
 - 流式 Token 输出（逐字渲染 LLM 回复）
 - 检索上下文展示（展示 RAG 命中的参考文档）
 - 多轮对话记忆（上下文连贯）
@@ -54,6 +55,35 @@ st.markdown("""
         color: #667eea;
         font-weight: 600;
         font-size: 0.8rem;
+    }
+    /* ReAct 推理链样式 */
+    .react-thought {
+        background: #fff3cd;
+        border-left: 3px solid #ffc107;
+        padding: 0.6rem 1rem;
+        margin: 0.4rem 0;
+        border-radius: 0 6px 6px 0;
+        font-size: 0.82rem;
+        font-style: italic;
+        color: #856404;
+    }
+    .react-action {
+        background: #d1ecf1;
+        border-left: 3px solid #17a2b8;
+        padding: 0.6rem 1rem;
+        margin: 0.4rem 0;
+        border-radius: 0 6px 6px 0;
+        font-size: 0.82rem;
+        color: #0c5460;
+    }
+    .react-observation {
+        background: #d4edda;
+        border-left: 3px solid #28a745;
+        padding: 0.6rem 1rem;
+        margin: 0.4rem 0;
+        border-radius: 0 6px 6px 0;
+        font-size: 0.82rem;
+        color: #155724;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -147,12 +177,12 @@ def render_sidebar(agent: FusionRAGAgent):
 # ==================== 主界面 ====================
 
 def render_main(agent: FusionRAGAgent):
-    """渲染主界面：标题、对话消息、输入框。"""
+    """渲染主界面：标题、对话消息、ReAct 推理链、输入框。"""
 
     # 标题
-    st.markdown('<div class="main-title">FusionRAG · 智能客服 Agent</div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-title">FusionRAG · 智能客服 ReAct Agent</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="sub-title">FAISS + BM25 混合检索 · CrossEncoder 精排 · Qwen · Tool Calling</div>',
+        '<div class="sub-title">ReAct 推理循环 · FAISS + BM25 混合检索 · CrossEncoder 精排 · Qwen · Tool Calling</div>',
         unsafe_allow_html=True,
     )
 
@@ -170,10 +200,11 @@ def render_main(agent: FusionRAGAgent):
 
         # Agent 流式回复
         with st.chat_message("assistant"):
-            # 占位符，用于逐步更新内容
-            response_placeholder = st.empty()
-            ref_placeholder = st.empty()
+            response_placeholder = st.empty()   # 最终回答占位
+            trace_placeholder = st.empty()      # 推理链占位
+            ref_placeholder = st.empty()         # 检索参考占位
             full_response = ""
+            trace_html = ""                      # 推理链 HTML 拼接
 
             try:
                 for event_type, data in agent.ask_stream(prompt):
@@ -192,8 +223,38 @@ def render_main(agent: FusionRAGAgent):
                                     unsafe_allow_html=True,
                                 )
 
+                    elif event_type == "thought":
+                        # 💭 Agent 的推理过程（黄色卡片）
+                        trace_html += (
+                            f'<div class="react-thought">'
+                            f'💭 <b>Thought:</b> {data}'
+                            f'</div>'
+                        )
+                        trace_placeholder.markdown(trace_html, unsafe_allow_html=True)
+
+                    elif event_type == "tool_call":
+                        # 🔧 工具调用（蓝色卡片）
+                        trace_html += (
+                            f'<div class="react-action">'
+                            f'🔧 <b>Action:</b> {data["name"]}'
+                            f'({data["input"]}) — Step {data["step"]}'
+                            f'</div>'
+                        )
+                        trace_placeholder.markdown(trace_html, unsafe_allow_html=True)
+
+                    elif event_type == "observation":
+                        # 👁️ 工具返回结果（绿色卡片）
+                        preview = str(data)[:150]
+                        trace_html += (
+                            f'<div class="react-observation">'
+                            f'👁️ <b>Observation:</b> {preview}'
+                            f'{"..." if len(str(data)) > 150 else ""}'
+                            f'</div>'
+                        )
+                        trace_placeholder.markdown(trace_html, unsafe_allow_html=True)
+
                     elif event_type == "token":
-                        # 逐 Token 追加渲染
+                        # 逐 Token 追加渲染最终回答
                         full_response += data
                         response_placeholder.markdown(full_response + "▌")
 
@@ -204,7 +265,8 @@ def render_main(agent: FusionRAGAgent):
                 full_response = f"❌ 回答出错: {str(e)}"
                 response_placeholder.markdown(full_response)
 
-            # 记录助手回复
+            # 记录助手回复（包含推理链 + 最终回答）
+            trace_text = trace_html if trace_html else ""
             st.session_state.messages.append({
                 "role": "assistant",
                 "content": full_response,
