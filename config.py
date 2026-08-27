@@ -14,14 +14,15 @@ DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 LLM_MODEL = "qwen-plus"  # 可选: qwen-plus / qwen-turbo / qwen-max
 
 # ==================== 嵌入模型配置 ====================
-# bge-large-zh-v1.5：BAAI 出品，中文语义检索 SOTA 级模型
+# 使用 DashScope 云端 Embedding API（text-embedding-v3），无需下载本地模型
 # 输出维度 1024，适合 FAISS 索引
-EMBEDDING_MODEL = "BAAI/bge-large-zh-v1.5"
+EMBEDDING_MODEL = "text-embedding-v3"
 EMBEDDING_DIMENSION = 1024
 
 # ==================== 重排模型配置 ====================
-# bge-reranker-large：CrossEncoder 架构，对候选文档做精细打分
-# 比 BiEncoder 慢但准确率高，适合 Top-K 精排
+# 设为 True 时使用 CrossEncoder 精排（需安装 sentence-transformers，约 1.2GB）
+# 设为 False 时跳过精排，直接用 RRF 融合分数排序（轻量，无需下载）
+USE_RERANKER = False
 RERANKER_MODEL = "BAAI/bge-reranker-large"
 
 # ==================== 检索参数 ====================

@@ -1,19 +1,24 @@
 """
 FusionRAG 混合检索引擎
 =======================
-核心架构：密集向量（FAISS） + 稀疏关键词（BM25 + jieba） → CrossEncoder 精排
+核心架构：密集向量（DashScope Embedding API） + 稀疏关键词（BM25 + jieba） → 可选 CrossEncoder 精排
 
 检索流程：
   用户查询
-    ├── FAISS 向量检索 → Top-10 语义相似文档
+    ├── DashScope 向量检索 → Top-10 语义相似文档（云端 API，无需下载模型）
     ├── BM25 关键词检索 → Top-10 词频匹配文档
     ├── 去重合并（RRF 倒数排序融合）
-    └── CrossEncoder 精排 → Top-3 最终结果
+    └── [可选] CrossEncoder 精排 → Top-3 最终结果
 
 设计思路：
   - 向量检索擅长语义匹配（"退货"能匹配"退款""换货"）
   - BM25 擅长精确关键词匹配（订单号、产品型号等专有名词）
-  - CrossEncoder 对合并后的候选集做精细打分，取最优
+  - CrossEncoder 对合并后的候选集做精细打分，取最优（可选）
+
+为什么用 DashScope API 而非本地模型？
+  - 无需下载 1.2GB 的 bge 模型，pip install 秒级完成
+  - text-embedding-v3 是阿里官方中文嵌入模型，效果与 bge 系列相当
+  - 唯一的代价是网络延迟（约 50-100ms/次），对小规模知识库影响可忽略
 """
 
 import os
@@ -23,10 +28,17 @@ from typing import List, Tuple
 import jieba
 import numpy as np
 from rank_bm25 import BM25Okapi
-from sentence_transformers import SentenceTransformer, CrossEncoder
+from openai import OpenAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 import config
+
+# CrossEncoder 是可选依赖，没装 sentence-transformers 也能跑
+try:
+    from sentence_transformers import CrossEncoder
+    _HAS_CROSSENCODER = True
+except ImportError:
+    _HAS_CROSSENCODER = False
 
 
 # ==================== 文档数据类 ====================
@@ -59,9 +71,9 @@ class HybridRetriever:
     """
 
     def __init__(self):
-        # 延迟加载模型，避免初始化时就下载大模型
-        self._embedding_model = None
-        self._reranker_model = None
+        # 延迟加载模型，避免初始化时就发起网络请求
+        self._embedding_client = None  # DashScope OpenAI 客户端
+        self._reranker_model = None    # CrossEncoder（可选）
 
         # 索引数据
         self._faiss_index = None       # FAISS 索引对象
@@ -72,22 +84,60 @@ class HybridRetriever:
     # -------------------- 模型懒加载 --------------------
 
     @property
-    def embedding_model(self) -> SentenceTransformer:
+    def embedding_client(self) -> OpenAI:
         """
-        懒加载嵌入模型 bge-large-zh-v1.5。
-        首次调用时从 HuggingFace 下载（约 1.2GB），之后走本地缓存。
+        懒加载 DashScope Embedding 客户端。
+        使用 OpenAI SDK 兼容 DashScope 的 /v1/embeddings 端点，
+        无需下载本地模型，直接调云端 API。
         """
-        if self._embedding_model is None:
-            print(f"[加载模型] {config.EMBEDDING_MODEL} ...")
-            self._embedding_model = SentenceTransformer(config.EMBEDDING_MODEL)
-        return self._embedding_model
+        if self._embedding_client is None:
+            print(f"[Embedding] 使用 DashScope API: {config.EMBEDDING_MODEL}")
+            self._embedding_client = OpenAI(
+                api_key=config.DASHSCOPE_API_KEY,
+                base_url=config.DASHSCOPE_BASE_URL,
+            )
+        return self._embedding_client
+
+    def _embed_texts(self, texts: List[str]) -> np.ndarray:
+        """
+        调用 DashScope Embedding API 将文本列表编码为向量矩阵。
+
+        与本地 SentenceTransformer.encode() 的区别：
+        - 本地：GPU/CPU 上直接计算，无网络延迟
+        - API：HTTP 请求到 DashScope 云端，约 50-100ms/次
+        - 对批量文档（构建索引时）会自动分批请求
+
+        返回归一化后的向量矩阵（L2 norm = 1），内积 = 余弦相似度。
+        """
+        all_embeddings = []
+        batch_size = 25  # DashScope 单次最多 25 条
+
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            response = self.embedding_client.embeddings.create(
+                model=config.EMBEDDING_MODEL,
+                input=batch,
+                dimensions=config.EMBEDDING_DIMENSION,
+            )
+            # 提取向量，DashScope 返回的已经做了 L2 归一化
+            batch_embeddings = [item.embedding for item in response.data]
+            all_embeddings.extend(batch_embeddings)
+
+        return np.array(all_embeddings, dtype=np.float32)
 
     @property
-    def reranker_model(self) -> CrossEncoder:
+    def reranker_model(self):
         """
-        懒加载 CrossEncoder 重排模型 bge-reranker-large。
-        CrossEncoder 对每个 (query, doc) 对做完整注意力计算，精度高于 BiEncoder。
+        懒加载 CrossEncoder 重排模型（仅当 config.USE_RERANKER=True 时）。
+        需要安装 sentence-transformers（约 1.2GB）。
         """
+        if not config.USE_RERANKER:
+            return None
+
+        if not _HAS_CROSSENCODER:
+            print("[警告] USE_RERANKER=True 但未安装 sentence-transformers，跳过精排")
+            return None
+
         if self._reranker_model is None:
             print(f"[加载模型] {config.RERANKER_MODEL} ...")
             self._reranker_model = CrossEncoder(config.RERANKER_MODEL)
@@ -141,24 +191,17 @@ class HybridRetriever:
         构建 FAISS 向量索引。
 
         流程：
-        1. 用 bge-large-zh-v1.5 将所有文档块编码为 1024 维向量
+        1. 调用 DashScope text-embedding-v3 API 将文档块编码为 1024 维向量
         2. 创建 FAISS IndexFlatIP（内积相似度，适合归一化向量）
         3. 将向量加入索引
 
         为什么用 IndexFlatIP 而非 IndexFlatL2？
-        bge 模型输出的向量已做 L2 归一化，此时内积 = 余弦相似度。
+        DashScope 返回的向量已做 L2 归一化，此时内积 = 余弦相似度。
         """
         import faiss
 
-        print("[构建FAISS] 编码文档向量 ...")
-        # normalize_embeddings=True 让向量 L2 归一化，内积等价于余弦相似度
-        embeddings = self.embedding_model.encode(
-            [doc.text for doc in documents],
-            normalize_embeddings=True,
-            show_progress_bar=True,
-            batch_size=32,
-        )
-        embeddings = np.array(embeddings, dtype=np.float32)
+        print("[构建FAISS] 调用 DashScope Embedding API 编码文档向量 ...")
+        embeddings = self._embed_texts([doc.text for doc in documents])
 
         # 创建内积索引（余弦相似度）
         dimension = embeddings.shape[1]
@@ -171,14 +214,10 @@ class HybridRetriever:
     def _search_faiss(self, query: str, top_k: int) -> List[Tuple[int, float]]:
         """
         FAISS 向量检索：返回 (文档索引, 相似度分数) 列表。
-        查询向量也做归一化，保证内积 = 余弦相似度 ∈ [0, 1]。
+        查询也通过 DashScope API 编码为向量。
         """
-        query_embedding = self.embedding_model.encode(
-            [query], normalize_embeddings=True
-        )
-        query_vec = np.array(query_embedding, dtype=np.float32)
-
-        scores, indices = self._faiss_index.search(query_vec, top_k)
+        query_embedding = self._embed_texts([query])
+        scores, indices = self._faiss_index.search(query_embedding, top_k)
         return list(zip(indices[0].tolist(), scores[0].tolist()))
 
     # -------------------- BM25 稀疏索引 --------------------
@@ -348,7 +387,7 @@ class HybridRetriever:
 
     def retrieve(self, query: str, top_k: int = None) -> List[Document]:
         """
-        完整检索管线：双路召回 → RRF 融合 → CrossEncoder 精排。
+        完整检索管线：双路召回 → RRF 融合 → [可选] CrossEncoder 精排。
 
         参数：
             query: 用户查询文本
@@ -356,6 +395,10 @@ class HybridRetriever:
 
         返回：
             按相关度降序排列的 Document 列表
+
+        两种模式：
+        - USE_RERANKER=True:  双路召回 → RRF 融合 → CrossEncoder 精排
+        - USE_RERANKER=False: 双路召回 → RRF 融合 → 直接按 RRF 分数排序
         """
         top_k = top_k or config.RERANK_TOP_K
 
@@ -366,10 +409,17 @@ class HybridRetriever:
         # Step 2: RRF 融合，合并候选集并去重
         merged = self._rrf_merge(faiss_results, bm25_results)
 
-        # 取融合后 Top-2K 候选送去精排（平衡精度和速度）
-        rerank_candidates = merged[: config.RERANK_TOP_K * 3]
-
-        # Step 3: CrossEncoder 精排
-        final_results = self._rerank(query, rerank_candidates, top_k)
+        # Step 3: 是否使用 CrossEncoder 精排
+        if config.USE_RERANKER and self.reranker_model is not None:
+            # 精排模式：取融合后 Top-3K 候选送去 CrossEncoder
+            rerank_candidates = merged[: config.RERANK_TOP_K * 3]
+            final_results = self._rerank(query, rerank_candidates, top_k)
+        else:
+            # 轻量模式：直接用 RRF 融合分数排序
+            final_results = []
+            for doc_idx, rrf_score in merged[:top_k]:
+                doc = self._documents[doc_idx]
+                doc.score = rrf_score
+                final_results.append(doc)
 
         return final_results
