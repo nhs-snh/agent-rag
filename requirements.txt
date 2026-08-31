@@ -24,3 +24,6 @@ pydantic>=2.0
 
 # [Optional] Only needed when USE_RERANKER=True (~1.2GB download)
 # sentence-transformers>=2.2.0
+
+# [Optional] PDF text extraction for knowledge base upload
+PyPDF2>=3.0.0

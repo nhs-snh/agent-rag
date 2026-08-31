@@ -20,6 +20,9 @@ env/
 # Model cache (本地下载的模型文件很大，不要推到 GitHub)
 index_data/
 
+# Uploaded knowledge base files (user-uploaded, should not be committed)
+knowledge_uploads/
+
 # OS
 .DS_Store
 Thumbs.db

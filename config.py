@@ -7,8 +7,18 @@ DashScope 兼容 OpenAI 接口，所以用 base_url 指向 DashScope 端点。
 
 import os
 
-# ==================== 大模型配置 ====================
-# 通义千问 DashScope API（兼容 OpenAI 接口格式）
+# ==================== .env file support ====================
+# Read API key from .env file (local only, gitignored)
+_env_path = os.path.join(os.path.dirname(__file__), ".env")
+if os.path.exists(_env_path):
+    with open(_env_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line and "=" in line and not line.startswith("#"):
+                key, value = line.split("=", 1)
+                os.environ.setdefault(key.strip(), value.strip())
+
+# ==================== LLM Config ====================
 DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "sk-your-api-key-here")
 DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 LLM_MODEL = "qwen-plus"  # 可选: qwen-plus / qwen-turbo / qwen-max

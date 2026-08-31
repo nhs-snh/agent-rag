@@ -6,6 +6,7 @@ Web 界面，支持：
 - 流式 Token 输出（逐字渲染 LLM 回复）
 - 检索上下文展示（展示 RAG 命中的参考文档）
 - 多轮对话记忆（上下文连贯）
+- 知识库文件上传（支持 .txt / .md / .pdf）
 - 对话历史清空
 
 启动命令：
@@ -15,6 +16,10 @@ Web 界面，支持：
 import streamlit as st
 from agent import FusionRAGAgent
 import os
+import time
+
+# 知识库上传目录（项目根目录下）
+UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "knowledge_uploads")
 
 # ==================== 页面配置 ====================
 
@@ -112,58 +117,168 @@ def init_session():
     if "ref_docs" not in st.session_state:
         st.session_state.ref_docs = []
 
+    # 当前使用的知识库文件路径
+    if "current_kb_path" not in st.session_state:
+        st.session_state.current_kb_path = ""
+
+
+# ==================== 文件上传工具函数 ====================
+
+def save_uploaded_file(uploaded_file) -> str:
+    """
+    保存 Streamlit 上传的文件到 knowledge_uploads/ 目录。
+    返回保存后的绝对路径。
+
+    PDF 文件会被提取纯文本后保存为 .txt，
+    这样 retriever.py 的文本切片逻辑无需修改。
+    """
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+    # 生成唯一文件名：时间戳 + 原始文件名，防止覆盖
+    timestamp = int(time.time())
+    filename = uploaded_file.name
+    ext = os.path.splitext(filename)[1].lower()
+
+    if ext == ".pdf":
+        # PDF → 提取纯文本 → 保存为 .txt
+        text = _extract_pdf_text(uploaded_file.read())
+        save_name = f"{timestamp}_{os.path.splitext(filename)[0]}.txt"
+        save_path = os.path.join(UPLOAD_DIR, save_name)
+        with open(save_path, "w", encoding="utf-8") as f:
+            f.write(text)
+    else:
+        # .txt / .md 直接保存原文
+        save_name = f"{timestamp}_{filename}"
+        save_path = os.path.join(UPLOAD_DIR, save_name)
+        with open(save_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+
+    return save_path
+
+
+def _extract_pdf_text(pdf_bytes: bytes) -> str:
+    """
+    从 PDF 二进制中提取纯文本。
+    优先用 PyPDF2，没装则降级提示。
+    """
+    try:
+        from PyPDF2 import PdfReader
+        import io
+
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        pages = []
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                pages.append(text)
+        return "\n\n".join(pages)
+    except ImportError:
+        return "（PDF 文本提取需要安装 PyPDF2：pip install PyPDF2）"
+
 
 # ==================== 侧边栏 ====================
 
 def render_sidebar(agent: FusionRAGAgent):
-    """渲染侧边栏：知识库加载、模型信息、对话管理。"""
+    """渲染侧边栏：知识库上传/加载、模型信息、对话管理。"""
     with st.sidebar:
-        st.header("⚙️ 控制面板")
+        st.header("控制面板")
 
-        # 知识库文件路径
-        knowledge_file = st.text_input(
-            "知识库文件路径",
-            value="sample_knowledge.txt",
-            help="支持 .txt 格式的文本文件，UTF-8 编码"
-        )
+        # ---------- 知识库管理（Tab 切换：上传 / 路径） ----------
+        st.subheader("知识库管理")
 
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("📂 加载知识库", use_container_width=True):
-                if os.path.exists(knowledge_file):
-                    with st.spinner("构建索引中（首次约需2-5分钟）..."):
-                        agent.load_knowledge(knowledge_file)
+        tab_upload, tab_path = st.tabs(["上传文件", "指定路径"])
+
+        with tab_upload:
+            uploaded_file = st.file_uploader(
+                "上传知识库文件",
+                type=["txt", "md", "pdf"],
+                help="支持 .txt / .md / .pdf 格式，PDF 会自动提取文本"
+            )
+            if uploaded_file is not None:
+                # 显示文件信息
+                size_kb = uploaded_file.size / 1024
+                st.caption(f"{uploaded_file.name}  ({size_kb:.1f} KB)")
+
+                if st.button("保存并构建索引", use_container_width=True):
+                    with st.spinner("保存文件并构建索引中..."):
+                        saved_path = save_uploaded_file(uploaded_file)
+                        agent.load_knowledge(saved_path, force_rebuild=True)
                         st.session_state.knowledge_loaded = True
-                    st.success(f"✅ 知识库加载成功")
-                else:
-                    st.error(f"文件不存在: {knowledge_file}")
+                        st.session_state.current_kb_path = saved_path
+                    st.success("知识库加载成功")
 
-        with col2:
-            if st.button("🔄 强制重建", use_container_width=True):
-                if os.path.exists(knowledge_file):
-                    with st.spinner("重建索引中..."):
-                        agent.load_knowledge(knowledge_file, force_rebuild=True)
-                    st.success("✅ 索引已重建")
+        with tab_path:
+            knowledge_file = st.text_input(
+                "文件路径",
+                value="sample_knowledge.txt",
+                help="支持 .txt / .md 格式的文本文件，UTF-8 编码"
+            )
+
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("加载知识库", use_container_width=True):
+                    if os.path.exists(knowledge_file):
+                        with st.spinner("构建索引中（首次约需2-5分钟）..."):
+                            agent.load_knowledge(knowledge_file)
+                            st.session_state.knowledge_loaded = True
+                            st.session_state.current_kb_path = knowledge_file
+                        st.success("知识库加载成功")
+                    else:
+                        st.error(f"文件不存在: {knowledge_file}")
+
+            with col2:
+                if st.button("强制重建", use_container_width=True):
+                    target = st.session_state.current_kb_path or knowledge_file
+                    if os.path.exists(target):
+                        with st.spinner("重建索引中..."):
+                            agent.load_knowledge(target, force_rebuild=True)
+                        st.success("索引已重建")
+                    else:
+                        st.error(f"文件不存在: {target}")
 
         # 知识库状态
-        status = "✅ 已加载" if st.session_state.knowledge_loaded else "❌ 未加载"
+        status = "已加载" if st.session_state.knowledge_loaded else "未加载"
+        kb_path = st.session_state.current_kb_path
         st.metric("知识库状态", status)
+        if kb_path:
+            st.caption(f"当前: {os.path.basename(kb_path)}")
 
         st.divider()
 
-        # 模型信息
-        st.subheader("🧠 模型信息")
+        # ---------- 已上传文件列表 ----------
+        if os.path.exists(UPLOAD_DIR):
+            files = sorted(os.listdir(UPLOAD_DIR), reverse=True)
+            if files:
+                with st.expander(f"已保存的知识库文件 ({len(files)})"):
+                    for f in files[:10]:  # 最多展示 10 个
+                        fpath = os.path.join(UPLOAD_DIR, f)
+                        col_a, col_b = st.columns([3, 1])
+                        with col_a:
+                            st.caption(f)
+                        with col_b:
+                            # 点击可快速切换为当前知识库
+                            if st.button("加载", key=f"load_{f}", use_container_width=True):
+                                with st.spinner("构建索引中..."):
+                                    agent.load_knowledge(fpath, force_rebuild=True)
+                                    st.session_state.knowledge_loaded = True
+                                    st.session_state.current_kb_path = fpath
+                                st.success(f"已加载: {f}")
+                                st.rerun()
+
+        st.divider()
+
+        # ---------- 模型信息 ----------
+        st.subheader("模型信息")
         st.text(f"LLM: qwen-plus (DashScope)")
-        st.text(f"Embedding: bge-large-zh-v1.5")
-        st.text(f"Reranker: bge-reranker-large")
+        st.text(f"Embedding: text-embedding-v3")
         st.text(f"向量库: FAISS")
         st.text(f"稀疏检索: BM25 + jieba")
 
         st.divider()
 
-        # 对话管理
-        st.subheader("💬 对话管理")
-        if st.button("🗑️ 清空对话", use_container_width=True):
+        # ---------- 对话管理 ----------
+        st.subheader("对话管理")
+        if st.button("清空对话", use_container_width=True):
             agent.clear_history()
             st.session_state.messages = []
             st.session_state.ref_docs = []
