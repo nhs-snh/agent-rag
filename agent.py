@@ -32,6 +32,8 @@ ReAct 循环流程：
 from typing import Generator, Tuple, List
 import json
 import re
+import time
+import random
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
@@ -247,6 +249,71 @@ class FusionRAGAgent:
         # Agent 安全参数：最大推理步数（防止无限循环）
         self.max_iterations = max_iterations
 
+        # LLM 重试参数
+        self.max_retries = 3          # 最大重试次数
+        self.retry_base_delay = 1.0   # 基础退避时间（秒）
+
+    # -------------------- LLM 调用重试 --------------------
+
+    def _call_llm_with_retry(self, messages):
+        """
+        带指数退避重试的 LLM 调用（非流式）。
+
+        重试策略：
+        - 指数退避：delay = base_delay * 2^attempt + random_jitter
+        - 第1次重试等 ~1s，第2次 ~2s，第3次 ~4s
+        - 随机抖动（0~1s）防止多个请求同时重试（惊群效应）
+        - 可重试的错误：网络超时、429限流、500/502/503服务端故障
+        - 不可重试的错误：400参数错误、401认证失败（重试也没用）
+        """
+        for attempt in range(self.max_retries):
+            try:
+                return self.llm.invoke(messages)
+            except Exception as e:
+                error_str = str(e).lower()
+
+                # 不可重试的错误：认证失败、参数错误
+                if any(code in error_str for code in ["401", "400", "invalid api key", "authentication"]):
+                    raise
+
+                # 最后一次重试也失败了
+                if attempt == self.max_retries - 1:
+                    print(f"[LLM重试] 已重试 {self.max_retries} 次仍失败: {e}")
+                    raise
+
+                # 指数退避 + 随机抖动
+                delay = self.retry_base_delay * (2 ** attempt) + random.uniform(0, 1)
+                print(f"[LLM重试] 第{attempt+1}次失败: {type(e).__name__}, "
+                      f"{delay:.1f}s 后重试...")
+                time.sleep(delay)
+
+    def _stream_llm_with_retry(self, messages):
+        """
+        带指数退避重试的 LLM 流式调用。
+
+        与 _call_llm_with_retry 逻辑相同，但调用 stream() 而非 invoke()。
+        返回的是 generator，逐 chunk yield 给调用方。
+        """
+        for attempt in range(self.max_retries):
+            try:
+                for chunk in self.llm_streaming.stream(messages):
+                    yield chunk
+                return  # 流式正常结束
+            except Exception as e:
+                error_str = str(e).lower()
+
+                if any(code in error_str for code in ["401", "400", "invalid api key", "authentication"]):
+                    raise
+
+                if attempt == self.max_retries - 1:
+                    print(f"[LLM重试] 流式调用已重试 {self.max_retries} 次仍失败: {e}")
+                    raise
+
+                delay = self.retry_base_delay * (2 ** attempt) + random.uniform(0, 1)
+                print(f"[LLM重试] 流式第{attempt+1}次失败: {type(e).__name__}, "
+                      f"{delay:.1f}s 后重试...")
+                time.sleep(delay)
+
     # -------------------- 知识库管理 --------------------
 
     def load_knowledge(self, file_path: str, force_rebuild: bool = False):
@@ -364,9 +431,9 @@ class FusionRAGAgent:
         react_trace = []  # 本轮所有 Thought/Action/Observation
 
         for step in range(self.max_iterations):
-            # Step 1: 构建消息并调用 LLM
+            # Step 1: 构建消息并调用 LLM（带指数退避重试）
             messages = self._build_react_messages(query, context, react_trace)
-            response = self.llm.invoke(messages)
+            response = self._call_llm_with_retry(messages)
             llm_output = response.content.strip()
 
             # Step 2: 解析 ReAct 格式
@@ -470,7 +537,7 @@ class FusionRAGAgent:
                     ))
                 ]
 
-                for chunk in self.llm_streaming.stream(stream_messages):
+                for chunk in self._stream_llm_with_retry(stream_messages):
                     if chunk.content:
                         full_response += chunk.content
                         yield ("token", chunk.content)
